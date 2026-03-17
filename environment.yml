@@ -7,7 +7,7 @@ dependencies:
   - opencv
   - pip
   - pip:
-      - mediapipe
+      - mediapipe==0.10.9
       - ultralytics
       - torch
       - torchvision

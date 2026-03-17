@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
+*.pyo
+
+#models
+*.pt
+
+#env
 .env
 .venv
+
 build/
 dist/
