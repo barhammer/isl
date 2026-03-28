@@ -30,13 +30,13 @@ class MediaPipeRunner:
         self.scheduler = Scheduler()
         self.state = StateManager()
 
-        # 🔥 NEW: skip limiter
+        # 🔥 skip limiter
         self.skip_counts = {}
-        self.max_skip = 2  # tweak (2–3 ideal)
+        self.max_skip = 2
 
-    # 🔥 worker function (thread-safe)
+    # 🔥 worker function (UPDATED)
     def _process_one(self, args):
-        obj_id, crop, box, frame_shape, worker_id = args
+        obj_id, crop, box, pad, crop_size, frame_shape, worker_id = args
 
         processor = self.processors[worker_id]
         lock = self.locks[worker_id]
@@ -45,6 +45,8 @@ class MediaPipeRunner:
             hands = processor.process_crop(
                 crop,
                 box,
+                pad,
+                crop_size,
                 frame_shape
             )
 
@@ -76,30 +78,32 @@ class MediaPipeRunner:
 
             return output, interpolated
 
-        # 🔥 RUN INFERENCE (ALL PEOPLE — STABLE MODE)
-        crops = self.cropper.get_crops(frame, id_to_box)
-        obj_ids = list(crops.keys())
+        # 🔥 GET CROPS (NEW STRUCTURE)
+        crops, meta = self.cropper.get_crops(frame, id_to_box)
 
-        # 🔥 identify forced IDs (future-proof, currently redundant)
+        if len(crops) == 0:
+            return output, {}
+
+        # 🔥 extract obj_ids
+        obj_ids = [m[0] for m in meta]
+
+        # 🔥 identify forced IDs
         forced_ids = []
         for obj_id in obj_ids:
             if self.skip_counts.get(obj_id, 0) >= self.max_skip:
                 forced_ids.append(obj_id)
 
-       # 🔥 LIMIT processing (performance mode)
+        # 🔥 LIMIT processing
         MAX_PEOPLE = 2
-
         active_ids = []
 
-        # 🔥 1. Always include forced (skip limiter protection)
-        for fid in forced_ids:
-            active_ids.append(fid)
+        # 1. forced first
+        active_ids.extend(forced_ids)
 
-        # 🔥 2. Fill remaining slots
+        # 2. fill remaining
         remaining_slots = MAX_PEOPLE - len(active_ids)
 
         if remaining_slots > 0:
-            # exclude already selected
             remaining_ids = [i for i in obj_ids if i not in active_ids]
 
             if remaining_ids:
@@ -107,18 +111,26 @@ class MediaPipeRunner:
                     idx = (self.scheduler.person_index + i) % len(remaining_ids)
                     active_ids.append(remaining_ids[idx])
 
-                # 🔥 advance rotation
                 self.scheduler.person_index += remaining_slots
 
-        # 🔥 PREPARE TASKS
+        # 🔥 PREPARE TASKS (FIXED)
         tasks = []
 
-        for i, (obj_id, (crop, box)) in enumerate(crops.items()):
+        for i, (crop, (obj_id, box, pad, crop_size)) in enumerate(zip(crops, meta)):
             if obj_id not in active_ids:
                 continue
 
             worker_id = i % len(self.processors)
-            tasks.append((obj_id, crop, box, (frame_h, frame_w), worker_id))
+
+            tasks.append((
+                obj_id,
+                crop,
+                box,
+                pad,
+                crop_size,
+                (frame_h, frame_w),
+                worker_id
+            ))
 
         # 🔥 PARALLEL EXECUTION
         results_iter = self.executor.map(self._process_one, tasks)
@@ -132,7 +144,7 @@ class MediaPipeRunner:
         # 🔥 UPDATE STATE
         results = self.state.update(new_results)
 
-        # 🔥 UPDATE SKIP COUNTS (CORE LOGIC)
+        # 🔥 UPDATE SKIP COUNTS
         processed_ids = set(new_results.keys())
 
         for obj_id in obj_ids:
@@ -141,12 +153,12 @@ class MediaPipeRunner:
             else:
                 self.skip_counts[obj_id] = self.skip_counts.get(obj_id, 0) + 1
 
-        # 🔥 CLEANUP (avoid memory leak)
+        # 🔥 CLEANUP
         for obj_id in list(self.skip_counts.keys()):
             if obj_id not in obj_ids:
                 del self.skip_counts[obj_id]
 
-        # 🔥 KEEP scheduler motion update
+        # 🔥 scheduler update
         self.scheduler.update_motion(
             self.state.prev_results,
             self.state.curr_results

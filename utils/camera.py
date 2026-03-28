@@ -16,8 +16,10 @@ class Camera:
         if not ret:
             return False, None
 
-        # 🔥 enforce resolution (fallback if camera ignores settings)
-        frame = cv2.resize(frame, (self.width, self.height))
+        # Only resize if needed
+        h, w = frame.shape[:2]
+        if (w, h) != (self.width, self.height):
+            frame = cv2.resize(frame, (self.width, self.height))
 
         return True, frame
 
