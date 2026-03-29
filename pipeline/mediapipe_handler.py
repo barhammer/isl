@@ -10,7 +10,7 @@ class MediaPipeHandler:
         # ✅ fast tracking mode (works with per-ID instances in runner)
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=10,
+            max_num_hands=20,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )

@@ -34,7 +34,7 @@ class MediaPipeRunner:
         self.skip_counts = {}
         self.max_skip = 2
 
-    # 🔥 worker function (UPDATED)
+    # 🔥 worker function
     def _process_one(self, args):
         obj_id, crop, box, pad, crop_size, frame_shape, worker_id = args
 
@@ -56,7 +56,9 @@ class MediaPipeRunner:
         output = frame.copy()
         frame_h, frame_w = frame.shape[:2]
 
+        # ----------------------------------------
         # 🔥 SKIP FRAME → interpolate
+        # ----------------------------------------
         if not self.scheduler.should_run():
             interpolated = {}
 
@@ -78,42 +80,87 @@ class MediaPipeRunner:
 
             return output, interpolated
 
-        # 🔥 GET CROPS (NEW STRUCTURE)
+        # ----------------------------------------
+        # 🔥 GET CROPS
+        # ----------------------------------------
         crops, meta = self.cropper.get_crops(frame, id_to_box)
 
         if len(crops) == 0:
             return output, {}
 
-        # 🔥 extract obj_ids
         obj_ids = [m[0] for m in meta]
 
-        # 🔥 identify forced IDs
+        # ----------------------------------------
+        # 🔥 FORCED IDS (fairness)
+        # ----------------------------------------
         forced_ids = []
         for obj_id in obj_ids:
             if self.skip_counts.get(obj_id, 0) >= self.max_skip:
                 forced_ids.append(obj_id)
 
-        # 🔥 LIMIT processing
+        # ----------------------------------------
+        # 🔥 HYBRID SCHEDULER
+        # ----------------------------------------
         MAX_PEOPLE = 2
         active_ids = []
 
-        # 1. forced first
+        # STEP 1: forced first
         active_ids.extend(forced_ids)
 
-        # 2. fill remaining
         remaining_slots = MAX_PEOPLE - len(active_ids)
 
-        if remaining_slots > 0:
-            remaining_ids = [i for i in obj_ids if i not in active_ids]
+        # STEP 2: priority scoring
+        def priority_score(obj_id, box):
+            x1, y1, x2, y2 = box
 
-            if remaining_ids:
-                for i in range(remaining_slots):
-                    idx = (self.scheduler.person_index + i) % len(remaining_ids)
-                    active_ids.append(remaining_ids[idx])
+            area = (x2 - x1) * (y2 - y1)
 
-                self.scheduler.person_index += remaining_slots
+            cx = (x1 + x2) // 2
+            center_dist = abs(cx - frame_w // 2)
 
-        # 🔥 PREPARE TASKS (FIXED)
+            skip = self.skip_counts.get(obj_id, 0)
+
+            return (
+                0.0001 * area
+                - 0.01 * center_dist
+                + 2.0 * skip
+            )
+
+        scored = []
+        for obj_id, box, _, _ in meta:
+            scored.append((obj_id, priority_score(obj_id, box)))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        priority_ids = [obj_id for obj_id, _ in scored]
+
+        # STEP 3: round-robin order
+        rr_ids = []
+        if obj_ids:
+            for i in range(len(obj_ids)):
+                idx = (self.scheduler.person_index + i) % len(obj_ids)
+                rr_ids.append(obj_ids[idx])
+
+        self.scheduler.person_index += MAX_PEOPLE
+
+        # STEP 4: merge
+
+        # priority fill
+        for pid in priority_ids:
+            if pid not in active_ids:
+                active_ids.append(pid)
+            if len(active_ids) >= MAX_PEOPLE:
+                break
+
+        # round-robin fill
+        for rid in rr_ids:
+            if rid not in active_ids:
+                active_ids.append(rid)
+            if len(active_ids) >= MAX_PEOPLE:
+                break
+
+        # ----------------------------------------
+        # 🔥 PREPARE TASKS
+        # ----------------------------------------
         tasks = []
 
         for i, (crop, (obj_id, box, pad, crop_size)) in enumerate(zip(crops, meta)):
@@ -132,7 +179,9 @@ class MediaPipeRunner:
                 worker_id
             ))
 
+        # ----------------------------------------
         # 🔥 PARALLEL EXECUTION
+        # ----------------------------------------
         results_iter = self.executor.map(self._process_one, tasks)
 
         new_results = {}
@@ -141,10 +190,14 @@ class MediaPipeRunner:
             if hands:
                 new_results[obj_id] = hands
 
+        # ----------------------------------------
         # 🔥 UPDATE STATE
+        # ----------------------------------------
         results = self.state.update(new_results)
 
+        # ----------------------------------------
         # 🔥 UPDATE SKIP COUNTS
+        # ----------------------------------------
         processed_ids = set(new_results.keys())
 
         for obj_id in obj_ids:
@@ -153,18 +206,22 @@ class MediaPipeRunner:
             else:
                 self.skip_counts[obj_id] = self.skip_counts.get(obj_id, 0) + 1
 
-        # 🔥 CLEANUP
+        # cleanup dead IDs
         for obj_id in list(self.skip_counts.keys()):
             if obj_id not in obj_ids:
                 del self.skip_counts[obj_id]
 
-        # 🔥 scheduler update
+        # ----------------------------------------
+        # 🔥 UPDATE SCHEDULER
+        # ----------------------------------------
         self.scheduler.update_motion(
             self.state.prev_results,
             self.state.curr_results
         )
 
+        # ----------------------------------------
         # 🔹 DRAW
+        # ----------------------------------------
         for hands in results.values():
             for hand_landmarks in hands:
                 self.mediapipe.mp_draw.draw_landmarks(
