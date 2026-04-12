@@ -15,26 +15,21 @@ class MediaPipeRunner:
         self.mediapipe = MediaPipeHandler()
         self.cropper = Cropper()
 
-        # 🔥 THREAD POOL
         self.executor = ThreadPoolExecutor(max_workers=3)
 
-        # 🔥 one processor per worker
         self.processors = [
             HandProcessor(MediaPipeHandler()),
             HandProcessor(MediaPipeHandler())
         ]
 
-        # 🔥 one lock per processor
         self.locks = [threading.Lock() for _ in self.processors]
 
         self.scheduler = Scheduler()
         self.state = StateManager()
 
-        # 🔥 skip limiter
         self.skip_counts = {}
         self.max_skip = 2
 
-    # 🔥 worker function
     def _process_one(self, args):
         obj_id, crop, box, pad, crop_size, frame_shape, worker_id = args
 
@@ -61,6 +56,7 @@ class MediaPipeRunner:
         # ----------------------------------------
         if not self.scheduler.should_run():
             interpolated = {}
+            frame_flags = {}
 
             all_ids = set(self.state.curr_results) | set(self.state.prev_results)
 
@@ -71,6 +67,9 @@ class MediaPipeRunner:
                 hands = HandInterpolator.interpolate(prev, curr)
                 interpolated[obj_id] = hands
 
+                # 🔥 NEW: mark interpolated
+                frame_flags[obj_id] = 0.5
+
                 for hand_landmarks in hands:
                     self.mediapipe.mp_draw.draw_landmarks(
                         output,
@@ -78,7 +77,7 @@ class MediaPipeRunner:
                         self.mediapipe.mp_hands.HAND_CONNECTIONS
                     )
 
-            return output, interpolated
+            return output, interpolated, frame_flags
 
         # ----------------------------------------
         # 🔥 GET CROPS
@@ -86,12 +85,12 @@ class MediaPipeRunner:
         crops, meta = self.cropper.get_crops(frame, id_to_box)
 
         if len(crops) == 0:
-            return output, {}
+            return output, {}, {}
 
         obj_ids = [m[0] for m in meta]
 
         # ----------------------------------------
-        # 🔥 FORCED IDS (fairness)
+        # 🔥 FORCED IDS
         # ----------------------------------------
         forced_ids = []
         for obj_id in obj_ids:
@@ -104,20 +103,14 @@ class MediaPipeRunner:
         MAX_PEOPLE = 2
         active_ids = []
 
-        # STEP 1: forced first
         active_ids.extend(forced_ids)
 
-        remaining_slots = MAX_PEOPLE - len(active_ids)
-
-        # STEP 2: priority scoring
         def priority_score(obj_id, box):
             x1, y1, x2, y2 = box
 
             area = (x2 - x1) * (y2 - y1)
-
             cx = (x1 + x2) // 2
             center_dist = abs(cx - frame_w // 2)
-
             skip = self.skip_counts.get(obj_id, 0)
 
             return (
@@ -133,7 +126,6 @@ class MediaPipeRunner:
         scored.sort(key=lambda x: x[1], reverse=True)
         priority_ids = [obj_id for obj_id, _ in scored]
 
-        # STEP 3: round-robin order
         rr_ids = []
         if obj_ids:
             for i in range(len(obj_ids)):
@@ -142,16 +134,12 @@ class MediaPipeRunner:
 
         self.scheduler.person_index += MAX_PEOPLE
 
-        # STEP 4: merge
-
-        # priority fill
         for pid in priority_ids:
             if pid not in active_ids:
                 active_ids.append(pid)
             if len(active_ids) >= MAX_PEOPLE:
                 break
 
-        # round-robin fill
         for rid in rr_ids:
             if rid not in active_ids:
                 active_ids.append(rid)
@@ -195,6 +183,11 @@ class MediaPipeRunner:
         # ----------------------------------------
         results = self.state.update(new_results)
 
+        # 🔥 NEW: mark real frames
+        frame_flags = {}
+        for obj_id in results:
+            frame_flags[obj_id] = 1.0
+
         # ----------------------------------------
         # 🔥 UPDATE SKIP COUNTS
         # ----------------------------------------
@@ -206,7 +199,6 @@ class MediaPipeRunner:
             else:
                 self.skip_counts[obj_id] = self.skip_counts.get(obj_id, 0) + 1
 
-        # cleanup dead IDs
         for obj_id in list(self.skip_counts.keys()):
             if obj_id not in obj_ids:
                 del self.skip_counts[obj_id]
@@ -230,4 +222,4 @@ class MediaPipeRunner:
                     self.mediapipe.mp_hands.HAND_CONNECTIONS
                 )
 
-        return output, results
+        return output, results, frame_flags
