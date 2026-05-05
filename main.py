@@ -1,85 +1,157 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+from absl import logging as absl_logging
+absl_logging.set_verbosity(absl_logging.ERROR)
+absl_logging.set_stderrthreshold("error")
+
+import cv2
+import torch
+
 from utils.camera import Camera
 from pipeline.system import ISLPipeline
 from pipeline.visualizer import Visualizer
-import cv2
-import numpy as np
-import torch
-from training.model import GestureModel
+
+from inference.model_loader import load_static_system
+
+from runtime.fps import FPSCounter
+from collections import defaultdict
 
 
 def main():
-    camera = Camera()
+    # ----------------------------------------
+    # 🔹 Device
+    # ----------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Using device: {device}")
+
+    if device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+
+    # ----------------------------------------
+    # 🔹 Load model
+    # ----------------------------------------
+    model, label_map = load_static_system(device)
+    print("Loaded labels:", label_map)
+
+    # ----------------------------------------
+    # 🔹 Core components
+    # ----------------------------------------
+    camera = Camera(0)
     system = ISLPipeline()
+    fps_counter = FPSCounter()
 
-    # 🔥 Load model
-    model = GestureModel()
-    model.load_state_dict(torch.load("training/model.pth"))
-    model.eval()
+    delay = 33
 
-    # 🔥 Detection smoothing buffer
-    detection_count = {}
+    # 🔥 Flicker control
+    STABILITY_THRESHOLD = 3
 
+    last_preds = defaultdict(lambda: None)
+    pred_counts = defaultdict(int)
+    stable_labels = {}
+
+    # ----------------------------------------
+    # 🔁 Main loop
+    # ----------------------------------------
     while True:
         ret, frame = camera.read()
         if not ret:
             break
 
-        frame_out, landmarks_per_id, id_to_box, vectors_per_id, sequences_ready = system.process(frame)
+        frame_out, landmarks_per_id, id_to_box, vectors_per_id, _ = system.process(frame)
 
-        for obj_id, seq in sequences_ready.items():
+        for obj_id, vec in vectors_per_id.items():
 
             # ----------------------------------------
-            # 🔥 FIX 1: Ignore multi-hand inputs
+            # 🔥 NO HAND RESTRICTION (FIXED)
             # ----------------------------------------
-            num_hands = len(landmarks_per_id.get(obj_id, []))
-            if num_hands != 1:
-                detection_count[obj_id] = 0
+            if vec is None:
                 continue
 
             # ----------------------------------------
-            # 🔹 Prepare input
+            # 🔹 RAW TOP-1 PREDICTION
             # ----------------------------------------
-            seq_np = np.array(seq, dtype=np.float32)
-            x = torch.tensor(seq_np).unsqueeze(0)
+            x = torch.tensor(vec, dtype=torch.float32).unsqueeze(0).to(device)
 
-            # ----------------------------------------
-            # 🔹 Model inference
-            # ----------------------------------------
             with torch.no_grad():
                 out = model(x)
-                probs = torch.softmax(out, dim=1)
+                probs = torch.softmax(out, dim=1)[0]
 
             pred = torch.argmax(probs).item()
-            confidence = probs[0][pred].item()
+            confidence = probs[pred].item()
+            label_name = label_map.get(pred, "UNKNOWN")
 
             # ----------------------------------------
-            # 🔥 FIX 2: Temporal smoothing
+            # 🔥 STABILITY LOGIC
             # ----------------------------------------
-            if pred == 1 and confidence > 0.8:
-                detection_count[obj_id] = detection_count.get(obj_id, 0) + 1
+            if last_preds[obj_id] == pred:
+                pred_counts[obj_id] += 1
             else:
-                detection_count[obj_id] = 0
+                pred_counts[obj_id] = 1
+                last_preds[obj_id] = pred
+
+            if pred_counts[obj_id] >= STABILITY_THRESHOLD:
+                stable_labels[obj_id] = (label_name, confidence)
+
+            if obj_id not in stable_labels:
+                stable_labels[obj_id] = (label_name, confidence)
+
+            label_name, confidence = stable_labels[obj_id]
 
             # ----------------------------------------
-            # 🔥 PRINT ONLY WHEN IT MATTERS
+            # 🔹 Draw result near person ID
             # ----------------------------------------
-            if detection_count[obj_id] == 1:
-                print(f"Started detecting Peace (Conf: {confidence:.2f})")
+            if obj_id in id_to_box:
+                x1, y1, x2, y2 = id_to_box[obj_id]
 
-            if detection_count[obj_id] == 3:
-                print("✌️ PEACE DETECTED")
+                text = f"ID {obj_id}: {label_name} ({confidence:.2f})"
+
+                if confidence > 0.7:
+                    color = (0, 255, 0)
+                elif confidence > 0.4:
+                    color = (0, 255, 255)
+                else:
+                    color = (0, 165, 255)
+
+                cv2.putText(
+                    frame_out,
+                    text,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2
+                )
 
         # ----------------------------------------
-        # 🔹 Draw
+        # 🔹 FPS
+        # ----------------------------------------
+        fps = fps_counter.update()
+
+        # ----------------------------------------
+        # 🔹 Draw visuals
         # ----------------------------------------
         Visualizer.draw_people(frame_out, id_to_box)
         Visualizer.draw_hand_ids(frame_out, landmarks_per_id)
 
-        cv2.imshow("ISL", frame_out)
+        cv2.putText(
+            frame_out,
+            f"FPS: {fps}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2
+        )
 
-        if cv2.waitKey(1) & 0xFF == 27:
+        cv2.imshow("ISL DEMO", frame_out)
+
+        if cv2.waitKey(delay) & 0xFF == 27:
             break
 
+    # ----------------------------------------
+    # 🔹 Cleanup
+    # ----------------------------------------
     camera.release()
     cv2.destroyAllWindows()
 

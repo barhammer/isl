@@ -2,13 +2,13 @@ import math
 import numpy as np
 
 
-# MediaPipe hand connections (important pairs)
-CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),      # thumb
-    (0,5),(5,6),(6,7),(7,8),      # index
-    (0,9),(9,10),(10,11),(11,12), # middle
-    (0,13),(13,14),(14,15),(15,16), # ring
-    (0,17),(17,18),(18,19),(19,20)  # pinky
+# Finger chains (MediaPipe indices)
+FINGER_CHAINS = [
+    [0, 1, 2, 3, 4],      # Thumb
+    [0, 5, 6, 7, 8],      # Index
+    [0, 9, 10, 11, 12],   # Middle
+    [0, 13, 14, 15, 16],  # Ring
+    [0, 17, 18, 19, 20]   # Pinky
 ]
 
 
@@ -28,50 +28,88 @@ def angle_between(v1, v2):
 def extract_features(hand):
     landmarks = hand.landmark
 
-    # convert to numpy
+    # Convert to numpy array (21 x 3)
     pts = np.array([[lm.x, lm.y, lm.z] for lm in landmarks])
 
-    # ----------------------------------------
-    # 🔹 Bone vectors
-    # ----------------------------------------
     bone_vectors = []
-
-    for (i, j) in CONNECTIONS:
-        v = pts[j] - pts[i]
-        v = unit_vector(v)
-        bone_vectors.extend(v)
-
-    # ----------------------------------------
-    # 🔹 Angles between consecutive bones
-    # ----------------------------------------
     angles = []
 
-    for k in range(len(CONNECTIONS) - 1):
-        i1, j1 = CONNECTIONS[k]
-        i2, j2 = CONNECTIONS[k + 1]
+    # ----------------------------------------
+    # 🔹 Bone vectors + angles per finger
+    # ----------------------------------------
+    for chain in FINGER_CHAINS:
+        # Bone vectors
+        for i in range(len(chain) - 1):
+            v = pts[chain[i + 1]] - pts[chain[i]]
+            v = unit_vector(v)
+            bone_vectors.extend(v)
 
-        v1 = unit_vector(pts[j1] - pts[i1])
-        v2 = unit_vector(pts[j2] - pts[i2])
+        # Angles between consecutive bones
+        for i in range(len(chain) - 2):
+            v1 = unit_vector(pts[chain[i + 1]] - pts[chain[i]])
+            v2 = unit_vector(pts[chain[i + 2]] - pts[chain[i + 1]])
+            angles.append(angle_between(v1, v2) / math.pi)
 
-        ang = angle_between(v1, v2)
-        angles.append(ang)
+    # ----------------------------------------
+    # 🔹 Global orientation features (NEW)
+    # ----------------------------------------
 
-    return bone_vectors + angles
+    # Palm direction: wrist → middle base (0 → 9)
+    palm_vector = unit_vector(pts[9] - pts[0])
+
+    # Hand span: index base → pinky base (5 → 17)
+    span_vector = unit_vector(pts[17] - pts[5])
+
+    global_features = list(palm_vector) + list(span_vector)
+
+    return bone_vectors + angles + global_features
 
 
-def landmarks_to_vector(hands, confidence):
-    vector = []
+def landmarks_to_vector(hands):
+    left_features = None
+    right_features = None
 
-    for hand in hands[:2]:
+    # ----------------------------------------
+    # 🔹 Separate left and right hands
+    # ----------------------------------------
+    for hand in hands:
         features = extract_features(hand)
-        vector.extend(features)
 
-    # pad if less than 2 hands
-    target_len = len(extract_features(hands[0])) if hands else 75
+        label = getattr(hand, "label", None)
 
-    while len(vector) < target_len * 2:
-        vector.extend([0.0] * target_len)
+        if label == "Left":
+            left_features = features
+        elif label == "Right":
+            right_features = features
+        else:
+            # fallback if label missing
+            if left_features is None:
+                left_features = features
+            else:
+                right_features = features
 
-    vector.append(confidence)
+    # ----------------------------------------
+    # 🔹 Determine feature size
+    # ----------------------------------------
+    if left_features is not None:
+        feature_len = len(left_features)
+    elif right_features is not None:
+        feature_len = len(right_features)
+    else:
+        feature_len = 81  # fallback
+
+    # ----------------------------------------
+    # 🔹 Pad missing hands
+    # ----------------------------------------
+    if left_features is None:
+        left_features = [0.0] * feature_len
+
+    if right_features is None:
+        right_features = [0.0] * feature_len
+
+    # ----------------------------------------
+    # 🔹 Final vector
+    # ----------------------------------------
+    vector = left_features + right_features
 
     return vector

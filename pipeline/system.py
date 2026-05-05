@@ -60,8 +60,7 @@ class ISLPipeline:
         vectors_per_id = {}
 
         for obj_id, hands in landmarks_per_id.items():
-            confidence = frame_flags.get(obj_id, 0.5)
-            vec = landmarks_to_vector(hands, confidence)
+            vec = landmarks_to_vector(hands)
             vectors_per_id[obj_id] = vec
 
         # ----------------------------------------
@@ -83,6 +82,15 @@ class ISLPipeline:
             # check if ready
             if len(self.sequence_buffer[obj_id]) == self.max_seq_len:
                 sequences_ready[obj_id] = self.sequence_buffer[obj_id].copy()
+
+        # ----------------------------------------
+        # 🔹 Cleanup stale IDs
+        # ----------------------------------------
+        active_ids = set(vectors_per_id.keys())
+
+        for obj_id in list(self.sequence_buffer.keys()):
+            if obj_id not in active_ids:
+                del self.sequence_buffer[obj_id]
 
         # ----------------------------------------
         # 🔹 Debug (lightweight)

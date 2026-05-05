@@ -1,66 +1,120 @@
 import os
 import numpy as np
+import random
 
 
 class GestureDataset:
-    def __init__(self, data_dir="training/dataset", seq_len=30):
+    def __init__(
+        self,
+        data_dir="training/dataset",
+        seq_len=30,
+        stride=5,
+        split="train",
+        val_ratio=0.2,
+        seed=42,
+        label_map=None   # 🔥 IMPORTANT
+    ):
         self.data = []
         self.labels = []
         self.seq_len = seq_len
 
-        label_map = {
-            "None": 0,
-            "Peace": 1
-        }
-
         print(f"📂 Loading dataset from: {data_dir}")
+        print(f"🔀 Mode: {split}")
 
         if not os.path.exists(data_dir):
             print("❌ Dataset directory does not exist!")
             return
 
-        for label_name in os.listdir(data_dir):
-            print(f"➡️ Found folder: {label_name}")
+        random.seed(seed)
 
-            if label_name not in label_map:
-                print(f"⚠️ Skipping unknown label: {label_name}")
-                continue
+        # ----------------------------------------
+        # 🔥 LABEL MAP (shared system)
+        # ----------------------------------------
+        if label_map is None:
+            labels = sorted([
+                d for d in os.listdir(data_dir)
+                if os.path.isdir(os.path.join(data_dir, d))
+            ])
+            self.label_map = {label: i for i, label in enumerate(labels)}
+            print("🏷️ Auto label_map:", self.label_map)
+        else:
+            self.label_map = label_map
+            labels = sorted(self.label_map.keys())
+            print("🏷️ Using provided label_map:", self.label_map)
 
-            label = label_map[label_name]
+        # ----------------------------------------
+        # 🔥 PER-CLASS SPLIT (FIXED)
+        # ----------------------------------------
+        selected_files = []
+
+        for label_name in labels:
             folder = os.path.join(data_dir, label_name)
 
-            files = os.listdir(folder)
-            print(f"   📁 {label_name} contains {len(files)} files")
+            if not os.path.exists(folder):
+                print(f"⚠️ Missing folder: {label_name}")
+                continue
 
-            for file in files:
-                if not file.endswith(".npy"):
-                    print(f"   ⚠️ Skipping non-npy file: {file}")
-                    continue
+            label = self.label_map[label_name]
 
-                path = os.path.join(folder, file)
-                seq = np.load(path)
+            files = [
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if f.endswith(".npy")
+            ]
 
-                print(f"   ✅ Loaded {file} with shape {seq.shape}")
+            print(f"➡️ {label_name}: {len(files)} files")
 
-                if len(seq) < seq_len:
-                    print(f"   ⚠️ Skipping {file} (too short)")
-                    continue
+            if len(files) == 0:
+                continue
 
-                for i in range(len(seq) - seq_len):
-                    window = seq[i:i + seq_len]
-                    self.data.append(window)
-                    self.labels.append(label)
+            random.shuffle(files)
+            split_idx = int(len(files) * (1 - val_ratio))
+
+            if split == "train":
+                chosen = files[:split_idx]
+            elif split == "val":
+                chosen = files[split_idx:]
+            else:
+                raise ValueError("split must be 'train' or 'val'")
+
+            print(f"   → using {len(chosen)} files for {split}")
+
+            for f in chosen:
+                selected_files.append((f, label))
+
+        if len(selected_files) == 0:
+            print("❌ No data selected")
+            return
+
+        print(f"📊 Total selected files: {len(selected_files)}")
+
+        # ----------------------------------------
+        # 🔥 SEQUENCE CREATION
+        # ----------------------------------------
+        for path, label in selected_files:
+            seq = np.load(path)
+
+            if len(seq) < seq_len:
+                continue
+
+            for i in range(0, len(seq) - seq_len + 1, stride):
+                window = seq[i:i + seq_len]
+
+                self.data.append(window)
+                self.labels.append(label)
 
         self.data = np.array(self.data, dtype=np.float32)
         self.labels = np.array(self.labels, dtype=np.int64)
 
-        print("\n📊 FINAL DATASET STATS:")
+        # ----------------------------------------
+        # 🔹 Stats
+        # ----------------------------------------
+        print("\n📊 LSTM DATASET STATS:")
         print("Total samples:", len(self.data))
 
         if len(self.data) > 0:
             print("Data shape:", self.data.shape)
             print("Labels shape:", self.labels.shape)
-            print("Sample window shape:", self.data[0].shape)
         else:
             print("❌ NO DATA LOADED")
 
