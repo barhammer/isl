@@ -41,7 +41,7 @@ def main():
     system = ISLPipeline()
     fps_counter = FPSCounter()
 
-    delay = 33
+    delay = 1
 
     # 🔥 Flicker control
     STABILITY_THRESHOLD = 3
